@@ -136,6 +136,27 @@ def _epoch_deadline(start, now, epoch, planned, hard, required_epochs):
     return min(hard, max(planned, start + 1.25 * seconds_per_epoch * required_epochs))
 
 
+def _shortlist_groups(groups, screens, limit):
+    """Keep the best rate per depth before filling remaining shortlist positions."""
+    scored = []
+    for group, trial in zip(groups, screens, strict=True):
+        loss = (trial.get("terminal_checkpoint") or {}).get("validation_loss", math.inf)
+        scored.append((float(loss) if loss is not None else math.inf, group))
+    scored.sort(key=lambda item: item[0])
+    selected, depths = [], set()
+    for _, group in scored:
+        depth = len(group["hidden_dims"])
+        if depth not in depths and len(selected) < limit:
+            selected.append(group)
+            depths.add(depth)
+    for _, group in scored:
+        if len(selected) >= limit:
+            break
+        if group not in selected:
+            selected.append(group)
+    return selected
+
+
 class STGFeatureSelector(AbstractFeatureSelector):
     """Feature Selection using Stochastic Gates with auditable recovery.
 
@@ -147,7 +168,12 @@ class STGFeatureSelector(AbstractFeatureSelector):
     gate/open-probability ranges over 50 epochs, plus k..k+ceil(.1k) active gates.
     Strict terminal-checkpoint checks are unchanged. A promising in-band fit gets
     extra training time inside its hard deadline instead of immediately switching
-    architectures. Sequential lambda calibration receives larger group budgets.
+    architectures. Screen the full depth/rate grid for 100 epochs, select the best
+    rate per depth and calibrate lambda on a three-group shortlist. Default search
+    caps: 18 total trials (including screens), 2,000 epochs per full trial. All
+    candidates start from scratch; no weights or gate states transfer. Validation
+    plateau stopping after min_epochs can end an unstable trial, but such a trial
+    never claims native convergence and can only supply a flagged recovery ranking.
 
     Reserve 35% of the selection deadline for recovery if strict selection fails.
     Recovery broadens lambda by a factor of ten in each direction and explores
@@ -203,6 +229,10 @@ class STGFeatureSelector(AbstractFeatureSelector):
         "recovery_fraction",
         "ranking_min_epochs",
         "ranking_tolerance",
+        "screening_epochs",
+        "max_search_trials",
+        "refinement_groups",
+        "recovery_trials",
     )
     CACHE_STATE = (
         "search_results_",
@@ -253,7 +283,8 @@ class STGFeatureSelector(AbstractFeatureSelector):
             "phase",
         )
         return {
-            "schema_version": 3,
+            "schema_version": 4,
+            "training_epochs_total": sum(t.get("epochs", 0) for t in trials),
             "selection_mode": getattr(self, "selection_mode_", "not_fitted"),
             "recovery_used": getattr(self, "selection_mode_", None) == "ranked_recovery",
             "recovery_reason": getattr(self, "recovery_reason_", None),
@@ -287,7 +318,12 @@ class STGFeatureSelector(AbstractFeatureSelector):
                 "max_batch_size": self.max_batch_size,
                 "max_batches_per_epoch": self.max_batches_per_epoch,
                 "effective_batch_size": getattr(self, "effective_batch_size_", None),
-                "search_schedule": "strict calibration then broader gate-ranking recovery; finish promising fits",
+                "search_schedule": "screen depth/rate grid; refine shortlist and lambda; bounded ranking recovery",
+                "screening_epochs": self.screening_epochs,
+                "max_search_trials": self.max_search_trials,
+                "refinement_groups": self.refinement_groups,
+                "recovery_trials": self.recovery_trials,
+                "predictive_early_stopping": "after min_epochs, even if gates remain unstable; never claims native convergence",
                 "recovery_fraction": self.recovery_fraction,
                 "ranking_min_epochs": self.ranking_min_epochs,
                 "ranking_tolerance": self.ranking_tolerance,
@@ -307,7 +343,7 @@ class STGFeatureSelector(AbstractFeatureSelector):
         max_lambda_trials=8,
         sigma=0.5,
         val_fraction=0.2,
-        max_epochs=6000,
+        max_epochs=2000,
         min_epochs=500,
         patience=100,
         gate_window=50,
@@ -323,6 +359,10 @@ class STGFeatureSelector(AbstractFeatureSelector):
         recovery_fraction=0.35,
         ranking_min_epochs=10,
         ranking_tolerance=0.1,
+        screening_epochs=100,
+        max_search_trials=18,
+        refinement_groups=3,
+        recovery_trials=3,
         **kwargs,
     ):
         super().__init__(max_features=max_features, **kwargs)
@@ -370,6 +410,13 @@ class STGFeatureSelector(AbstractFeatureSelector):
             raise ValueError("device must be cpu, cuda or auto")
         if not 0 < recovery_fraction < 1 or ranking_min_epochs < 1 or ranking_tolerance < 0:
             raise ValueError("recovery_fraction must lie in (0,1); ranking settings must be positive/nonnegative")
+        if any(
+            not isinstance(x, int) or x < 1
+            for x in (screening_epochs, max_search_trials, refinement_groups, recovery_trials)
+        ):
+            raise ValueError("screening and search limits must be positive integers")
+        if max_search_trials < len(self.architectures) * len(self.learning_rates) + 2:
+            raise ValueError("max_search_trials must cover the screening grid and leave refinement/recovery trials")
         self.sigma, self.val_fraction = sigma, val_fraction
         self.max_epochs, self.min_epochs, self.patience = max_epochs, min_epochs, patience
         self.gate_window, self.evaluate_every = gate_window, evaluate_every
@@ -382,6 +429,8 @@ class STGFeatureSelector(AbstractFeatureSelector):
             ranking_min_epochs,
             ranking_tolerance,
         )
+        self.screening_epochs, self.max_search_trials = screening_epochs, max_search_trials
+        self.refinement_groups, self.recovery_trials = refinement_groups, recovery_trials
 
     def _batch_size(self, n_train):
         if self.max_batches_per_epoch is None:
@@ -446,8 +495,9 @@ class STGFeatureSelector(AbstractFeatureSelector):
         best_key, patience_loss, stale = (math.inf, math.inf), math.inf, 0
         history, status, epochs = [], "max_epochs", 0
         ranking_record, ranking_key = None, (True, math.inf)
+        epoch_limit = min(self.max_epochs, params.get("epoch_limit", self.max_epochs))
         upper = self.max_features + math.ceil(self.max_features * self.budget_tolerance)
-        for epoch in range(1, self.max_epochs + 1):
+        for epoch in range(1, epoch_limit + 1):
             if time.monotonic() >= deadline:
                 status = "time_limit"
                 break
@@ -470,7 +520,7 @@ class STGFeatureSelector(AbstractFeatureSelector):
                 status = "nonfinite_loss"
                 break
             epochs = epoch
-            if epoch % self.evaluate_every and epoch != self.max_epochs:
+            if epoch % self.evaluate_every and epoch != epoch_limit:
                 continue
             value = self._validation_loss(model, X_val, y_val, loss_fn, deadline)
             if value is None or not math.isfinite(value):
@@ -484,7 +534,7 @@ class STGFeatureSelector(AbstractFeatureSelector):
             count = int(np.sum(gates > 0))
             matched = converged and self.max_features <= count <= upper
             observed_now = time.monotonic()
-            horizon = min(self.max_epochs, self.min_epochs + self.gate_window + self.patience)
+            horizon = min(epoch_limit, self.min_epochs + self.gate_window + self.patience)
             deadline = _epoch_deadline(started, observed_now, epoch, deadline, hard_deadline, horizon)
             if self.max_features <= count <= upper and not converged and epoch >= self.min_epochs:
                 # Keep training the promising lambda rather than switching architecture.
@@ -494,7 +544,7 @@ class STGFeatureSelector(AbstractFeatureSelector):
                     epoch,
                     deadline,
                     hard_deadline,
-                    min(self.max_epochs, epoch + self.gate_window + self.patience),
+                    min(epoch_limit, epoch + self.gate_window + self.patience),
                 )
             record = {
                 "epoch": epoch,
@@ -526,14 +576,14 @@ class STGFeatureSelector(AbstractFeatureSelector):
             if matched and key < best_key:
                 best_key, best_record = key, last_record
                 best_state = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
-            if not converged:
+            if epoch < self.min_epochs:
                 patience_loss, stale = math.inf, 0
             elif value < patience_loss - self.min_delta:
                 patience_loss, stale = value, 0
             else:
                 stale += self.evaluate_every
-            if converged and stale >= self.patience:
-                status = "early_stopping"
+            if epoch >= self.min_epochs and stale >= self.patience:
+                status = "early_stopping" if converged else "predictive_early_stopping"
                 break
         selected_mu = None
         if status == "nonfinite_loss" or last_record is None or not last_record["budget_matched"]:
@@ -628,23 +678,71 @@ class STGFeatureSelector(AbstractFeatureSelector):
             with torch.random.fork_rng(devices=[device.index] if device.type == "cuda" else []):
                 # Warm lazy optimizer imports within the overall limit, before slicing trial budgets.
                 torch.optim.Adam([torch.nn.Parameter(torch.zeros(1, device=device))])
-                groups = [("strict", group) for group in strict_groups] + [
-                    ("recovery", group) for group in recovery_groups
-                ]
-                for group_index, (phase, group) in enumerate(groups):
-                    if phase == "recovery" and self.gate_means_ is not None:
-                        break
-                    now = time.monotonic()
-                    phase_deadline = strict_deadline if phase == "strict" else outer_deadline
-                    remaining = max(0, phase_deadline - now)
-                    if remaining <= 0:
-                        continue
-                    phase_groups_left = (
-                        len(strict_groups) - group_index if phase == "strict" else len(groups) - group_index
+
+                def evaluate(group, lam, phase, deadline, hard, epoch_limit=None):
+                    nonlocal best_key, ranked_key, ranked_best
+                    assert len(self.search_results_) < self.max_search_trials
+                    params = dict(group, **{"lambda": lam})
+                    if epoch_limit is not None:
+                        params["epoch_limit"] = epoch_limit
+                    mu, result = self._fit_trial(data, params, output_dim, seed, deadline, hard_deadline=hard)
+                    result["phase"] = phase
+                    self.search_results_.append(result)
+                    self._log(
+                        20,
+                        f"STG {phase}: lambda={lam:.6g}, layers={len(group['hidden_dims'])}, "
+                        f"lr={group['learning_rate']}, epochs={result['epochs']}, "
+                        f"native={result['terminal_native_count']}, budget_matched={result['budget_matched']}",
                     )
-                    # Allocate half the remaining phase to completing calibration, rather
-                    # than scattering unusable sub-500-epoch fits over all nine groups.
-                    group_deadline = min(phase_deadline, now + remaining / min(2, phase_groups_left))
+                    if phase == "screen":
+                        return result  # Screening checkpoints never qualify or supply final rankings.
+                    ranking = result.get("ranking_checkpoint")
+                    if ranking is not None:
+                        stable_rank = (
+                            ranking["window_complete"]
+                            and max(ranking["gate_change"], ranking["probability_change"]) <= self.ranking_tolerance
+                        )
+                        rank_key = (not stable_rank, ranking["validation_loss"])
+                        if rank_key < ranked_key:
+                            ranked_key, ranked_best = rank_key, dict(ranking, params=params)
+                    if mu is not None:
+                        key = (result["native_count"] - self.max_features, result["validation_loss"])
+                        if key < best_key:
+                            best_key = key
+                            self.best_params_, self.best_epoch_ = params, result["best_epoch"]
+                            self.best_validation_loss_, self.gate_means_ = result["validation_loss"], mu
+                            self.native_count_, self.gate_diagnostics_ = (
+                                result["native_count"],
+                                result["selected_checkpoint"],
+                            )
+                    return result
+
+                screen_limit = min(self.screening_epochs, self.min_epochs - self.evaluate_every)
+                screens, screened_groups = [], []
+                screen_deadline = min(strict_deadline, start + 0.2 * time_limit) if time_limit is not None else math.inf
+                if screen_limit > 0:
+                    for i, group in enumerate(strict_groups):
+                        now = time.monotonic()
+                        if now >= screen_deadline:
+                            break
+                        slice_end = now + (screen_deadline - now) / (len(strict_groups) - i)
+                        screens.append(evaluate(group, self.lambdas[-1], "screen", slice_end, slice_end, screen_limit))
+                        screened_groups.append(group)
+                shortlist = (
+                    _shortlist_groups(screened_groups, screens, self.refinement_groups)
+                    if screens
+                    else strict_groups[: self.refinement_groups]
+                )
+                available = self.max_search_trials - len(self.search_results_)
+                reserved = min(self.recovery_trials, available - 1)
+                refinement_left = available - reserved
+                for i, group in enumerate(shortlist):
+                    quota = min(
+                        self.max_lambda_trials,
+                        refinement_left - min(len(shortlist) - i - 1, max(0, refinement_left - 1)),
+                    )
+                    if quota <= 0:
+                        break
                     observations = []
                     candidate = (
                         self.best_params_["lambda"]
@@ -656,58 +754,45 @@ class STGFeatureSelector(AbstractFeatureSelector):
                             self.min_epochs,
                         )
                     )
-                    initial = (candidate,) if candidate is not None else self.lambdas
-                    if phase == "recovery" and candidate is not None:
-                        initial = tuple(dict.fromkeys((candidate / 10, candidate, candidate * 10)))[
-                            : self.max_lambda_trials
-                        ]
-                    for _ in range(self.max_lambda_trials):
+                    initial = (candidate if candidate is not None else self.lambdas[-1],)
+                    for _ in range(quota):
                         now = time.monotonic()
-                        remaining = max(0, group_deadline - now)
-                        if remaining <= 0:
+                        if now >= strict_deadline:
                             break
                         lam = _next_lambda(observations, initial, self.max_lambda_trials, self.max_features)
                         if lam is None:
                             break
-                        params = {
-                            "lambda": lam,
-                            "hidden_dims": group["hidden_dims"],
-                            "learning_rate": group["learning_rate"],
-                        }
-                        allowance = min(remaining, max(30.0, remaining / (self.max_lambda_trials - len(observations))))
-                        mu, result = self._fit_trial(
-                            data, params, output_dim, seed, now + allowance, hard_deadline=group_deadline
-                        )
-                        result["phase"] = phase
-                        self.search_results_.append(result)
+                        allowance = (strict_deadline - now) / max(1, refinement_left)
+                        result = evaluate(group, lam, "strict", now + allowance, strict_deadline)
+                        refinement_left -= 1
                         observations.append(result)
-                        ranking = result.get("ranking_checkpoint")
-                        if ranking is not None:
-                            stable_rank = ranking["window_complete"] and (
-                                max(ranking["gate_change"], ranking["probability_change"]) <= self.ranking_tolerance
-                            )
-                            rank_key = (not stable_rank, ranking["validation_loss"])
-                            if rank_key < ranked_key:
-                                ranked_key, ranked_best = rank_key, dict(ranking, params=params)
-                        self._log(
-                            20,
-                            f"STG trial: lambda={lam:.6g}, layers={len(group['hidden_dims'])}, "
-                            f"lr={group['learning_rate']}, epochs={result['epochs']}, "
-                            f"native={result['terminal_native_count']}, "
-                            f"converged={result['converged']}, budget_matched={result['budget_matched']}",
-                        )
-                        if mu is not None:
-                            key = (result["native_count"] - self.max_features, result["validation_loss"])
-                            if key < best_key:
-                                best_key = key
-                                self.best_params_, self.best_epoch_ = params, result["best_epoch"]
-                                self.best_validation_loss_, self.gate_means_ = result["validation_loss"], mu
-                                self.native_count_, self.gate_diagnostics_ = (
-                                    result["native_count"],
-                                    result["selected_checkpoint"],
-                                )
                         if result["budget_matched"]:
-                            break  # Spend the remaining time comparing architectures/rates.
+                            break
+
+                if self.gate_means_ is None:
+                    candidate = _calibration_seed(
+                        self.search_results_,
+                        self.max_features,
+                        self.max_features + math.ceil(self.max_features * self.budget_tolerance),
+                        self.min_epochs,
+                    )
+                    candidate = candidate if candidate is not None else self.lambdas[-1]
+                    for i in range(min(self.recovery_trials, self.max_search_trials - len(self.search_results_))):
+                        now = time.monotonic()
+                        if now >= outer_deadline:
+                            break
+                        group = recovery_groups[i % len(recovery_groups)]
+                        lam = candidate * (10.0 ** (i % 3 - 1))
+                        if not math.isfinite(lam) or lam <= 0:
+                            continue
+                        remaining_trials = min(
+                            self.recovery_trials - i, self.max_search_trials - len(self.search_results_)
+                        )
+                        result = evaluate(
+                            group, lam, "recovery", now + (outer_deadline - now) / remaining_trials, outer_deadline
+                        )
+                        if result["budget_matched"]:
+                            break
         finally:
             torch.set_num_threads(threads)
         self.budget_converged_ = self.gate_means_ is not None

@@ -18,6 +18,7 @@ from selectarena.methods.stg import (
     _gate_snapshot,
     _make_model,
     _next_lambda,
+    _shortlist_groups,
     _stability,
 )
 
@@ -176,12 +177,13 @@ def test_calibrate_lambda_before_switching_group_and_reuse_a_successful_seed(mon
     def fake_trial(data, params, output_dim, seed, deadline, *, hard_deadline):
         assert deadline <= hard_deadline
         attempts.append(params)
-        matched = params["lambda"] >= 1
+        screen = "epoch_limit" in params
+        matched = not screen and params["lambda"] >= 10
         mu = np.array([0.0] * 3 + [-1.0] * (data[0].shape[1] - 3)) if matched else None
         return mu, dict(
             params,
-            epochs=30,
-            converged=True,
+            epochs=5 if screen else 30,
+            converged=not screen,
             budget_matched=matched,
             native_count=3 if matched else None,
             calibration_count=3 if matched else 5,
@@ -189,13 +191,16 @@ def test_calibrate_lambda_before_switching_group_and_reuse_a_successful_seed(mon
             best_epoch=30 if matched else None,
             selected_checkpoint={},
             terminal_native_count=3 if matched else 5,
+            terminal_checkpoint={"native_count": 3 if matched else 5, "validation_loss": 1.0},
         )
 
     monkeypatch.setattr(selector, "_fit_trial", fake_trial)
     selector.fit_transform(X=X, y=y, problem_type="regression", time_limit=10)
     assert selector.budget_converged_
-    assert attempts[0]["hidden_dims"] == attempts[1]["hidden_dims"]
-    assert [p["lambda"] for p in attempts] == [0.1, 1.0, 1.0, 1.0]
+    assert all("epoch_limit" in p for p in attempts[:3])
+    full = [p for p in attempts if "epoch_limit" not in p]
+    assert full[0]["hidden_dims"] == full[1]["hidden_dims"]
+    assert [p["lambda"] for p in full] == [1.0, 10.0, 10.0, 10.0]
     assert {len(p["hidden_dims"]) for p in attempts} == {3, 4, 5}
 
 
@@ -232,7 +237,7 @@ def test_divergence_invalidates_an_earlier_eligible_checkpoint(monkeypatch):
     assert record["status"] == "nonfinite_loss" and not record["budget_matched"] and mu is None
 
 
-def test_unstable_support_cannot_early_stop_or_qualify(monkeypatch):
+def test_predictive_plateau_stops_unstable_support_without_claiming_convergence(monkeypatch):
     selector = small_selector(max_features=1)
     selector.problem_type, selector.max_features = "regression", 1
     data = (torch.ones(8, 3), torch.ones(2, 3), torch.ones(8, 1), torch.ones(2, 1))
@@ -249,7 +254,38 @@ def test_unstable_support_cannot_early_stop_or_qualify(monkeypatch):
         data, {"lambda": 0.1, "hidden_dims": (8, 8, 8), "learning_rate": 0.01}, 1, 0, math.inf
     )
     assert mu is None and not result["converged"] and not result["budget_matched"]
-    assert result["status"] == "max_epochs"
+    assert result["status"] == "predictive_early_stopping"
+    assert result["epochs"] < selector.max_epochs
+
+
+def test_shortlist_selects_the_best_screened_rate_at_each_depth():
+    groups = _balanced_groups(
+        ((8, 8, 8), (8, 8, 8, 8), (8, 8, 8, 8, 8)), (0.001, 0.003, 0.01), np.random.default_rng(0)
+    )
+    scores = [{"terminal_checkpoint": {"validation_loss": float(i)}} for i in range(len(groups))]
+    scores[6]["terminal_checkpoint"]["validation_loss"] = -1
+    chosen = _shortlist_groups(groups, scores, 3)
+    assert len(chosen) == 3 and {len(g["hidden_dims"]) for g in chosen} == {3, 4, 5}
+    assert chosen[0] == groups[6]
+
+
+def test_search_budget_caps_total_trials_and_screening_never_counts_as_native_convergence():
+    X, y = synthetic_data("regression", n_samples=40)
+    selector = small_selector(gate_tolerance=0, max_search_trials=4)
+    selector.fit_transform(X=X, y=y, problem_type="regression")
+    assert len(selector.search_results_) <= 4
+    screens = [t for t in selector.search_results_ if t["phase"] == "screen"]
+    assert screens and all(t["epochs"] < selector.min_epochs and not t["budget_matched"] for t in screens)
+    assert selector.selection_mode_ == "ranked_recovery" and not selector._feature_selection_random_features
+    assert selector.get_selection_diagnostics()["training_epochs_total"] == sum(
+        t["epochs"] for t in selector.search_results_
+    )
+
+
+def test_high_epoch_search_is_bounded_by_default():
+    selector = STGFeatureSelector(max_features=3)
+    assert selector.max_search_trials == 18 and selector.max_epochs == 2000
+    assert selector.screening_epochs == 100 and selector.refinement_groups == 3
 
 
 def test_later_loss_of_sparse_support_invalidates_earlier_checkpoint(monkeypatch):
@@ -344,6 +380,8 @@ def test_cuda_rng_is_preserved():
         {"sigma": 0},
         {"max_batch_size": 0},
         {"max_batches_per_epoch": 0},
+        {"max_search_trials": 10},
+        {"screening_epochs": 0},
     ],
 )
 def test_invalid_search_space(kwargs):
